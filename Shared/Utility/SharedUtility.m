@@ -1,0 +1,850 @@
+//
+// --------------------------------------------------------------------------
+// SharedUtility.m
+// Created for Mac Mouse Fix (https://github.com/noah-nuebling/mac-mouse-fix)
+// Created by Noah Nuebling in 2020
+// Licensed under the MMF License (https://github.com/noah-nuebling/mac-mouse-fix/blob/master/License)
+// --------------------------------------------------------------------------
+//
+
+#import "SharedUtility.h"
+#import "Locator.h"
+//#import "Config.h"
+#import "SharedUtility.h"
+@import AppKit.NSScreen;
+#import <objc/runtime.h>
+#import "Logging.h"
+#import "MFGate.h"
+#import "SharedMacros.h"
+
+@implementation SharedUtility
+
+#pragma mark - MFLocales
+
+/// TODO: Why is this in SharedUtility.m, and not in Localization.m / LocalizationUtility.m? [Feb 2026]
+
+NSString *MFLocale(void) {
+
+    /// Return the app's current locale code
+    /// E.g. `en`, `de`, `pt-BR`, `fr`, `zh-Hans`, ...
+    ///
+    /// These codes are also found:
+    ///     - In the .pbxproj (under `knownRegions`)
+    ///     - In the .xcstrings files (under `localizations`)
+    ///     - In our Python scripts that localize the website and markdown-files [Feb 2026]
+    ///
+    /// Alternative APIs:
+    ///     These return the *System Settings'* locale (not the *app's* locale):
+    ///         - `[NSLocale currentLocale]`     (aka `Locale.currentLocale` in Swift),
+    ///         - `[NSLocale preferredLocale]` (private)
+    ///         (We're using these deliberately in the `LicenseUtility.currentRegionCode`)
+    ///     - These return the *app's* locale:
+    ///         - `[[NSBundle mainBundle] preferredLocalizations]` (Currently using this [Feb 2026])
+    ///         - `[NSLocale preferredLanguages]`                                       (Not sure what the difference is [Feb 2026])
+    ///         - `[[[NSUserDefaults standardUserDefaults] objectForKey: @"AppleLanguages"] firstObject]` (Not sure what the difference is [Feb 2026])
+    ///     - See: https://stackoverflow.com/questions/1522210/nslocale-currentlocale-always-returns-en-us-not-users-current-language
+    ///         - See this (about `@"AppleLanguages"`): https://developer.apple.com/library/archive/qa/qa1391/_index.html
+    ///
+    /// Usage tip:
+    ///     The resulting strings can be passed as 'locale identifiers' to `[NSLocale localeWithLocaleIdentifier:]`, `[NSLocale componentsFromLocaleIdentifier:]` and related APIs.
+    ///
+    /// Current usage pattern: [Feb 2026]
+    ///     - When we need to get the **app's locale/language**, we always use `MFLocale()` or (`MFLanguageCode()`)
+    ///     - When we need to get the **system locale** (for freeCountry mechanism), we use `NSLocale.currentLocale` (aka `Locale.current` in Swift)
+    ///     - We use `NSLocale.preferredLocale` (private) in one instance, IIRC because we were recreating Apple framework disassembly, and they used that – not totally sure how this behaves.
+    
+    NSString *result = [[[NSBundle mainBundle] preferredLocalizations] firstObject]; /// I've only ever seen this contain one entry [Feb 2026]
+    if (!result) {
+        assert(false); /// Don't think this can happen [Feb 2026]
+        result = @"en";
+    }
+    return result;
+}
+
+NSString *MFLanguageCode(void) {
+    /// Returns just the first part of the `MFLocale()` e.g. zh for zh-Hans, or pt for pt-Br
+    ///     ... This is pretty unnecessary – we should probably stop using this and just use MFLocale() directly. [Feb 2026]
+    auto result = [[NSLocale componentsFromLocaleIdentifier: MFLocale()] objectForKey: NSLocaleLanguageCode];
+    if (!result) {
+        assert(false); /// Don't think this can happen [Feb 2026]
+        result = @"en";
+    }
+    return (id)result;
+}
+
+
+#pragma mark - runLoops
+
+static NSArray<NSRunLoopMode> *_resolveModes(CFRunLoopRef rl, NSArray<NSRunLoopMode> *_Nullable modes) {
+    if (modes && modes.count == 0) {
+        assert(false && "modes should not be an empty array. Pass nil for the default value.");
+        modes = nil;
+    }
+    if (!modes) {
+        if ((1))    modes = (id)NSRunLoopCommonModes;                       /// Using CommonModes should grant our workload pretty high priorty || Note that we're passing the mode directly (instead of passing an array of modes) – that also works.
+        else        modes = CFBridgingRelease(CFRunLoopCopyAllModes(rl));   /// Passing all modes should grant our workload very high priority. Could this lead to unforseen problems? ... Not using this for now out of fear and terror. Ahhhhh.
+    }
+
+    return modes;
+}
+
+void MFCFRunLoopPerform(CFRunLoopRef _Nonnull rl, NSArray<NSRunLoopMode> *_Nullable modes, void (^_Nonnull workload)(void)) {
+    /// Usage:
+    ///     `modes` arg:
+    ///     - Pass nil to fall back to the default value.
+    ///     - You can also pass a single NSRunLoopMode (instead of an array of NSRunLoopModes)
+    
+    /// Meta-Discussion: Which API to use to perform stuff on a different runLoop?
+    ///     - `dispatch_async()`? Maybe, but only works on the mainRunLoop (?). Also I'd like to use the lower-level APIs directly. It also doesn't let us control the runLoopMode.
+    ///     - `-[NSRunLoop performInModes:block:]`? Maybe, but the docs say NSRunLoop APIs aren't thread-safe.
+    ///         Sidenote: Uses CFRunLoopPerformBlock() under-the-hood.
+    ///         Sidenote: The simpler variant -[NSRunLoop performBlock:] only runs in the default mode based on my assembly-investigations.
+    ///     - `-[NSObject performSelector:onThread:...]`? Should work, is flexible (can be delayed, and canceled just like NSTimer, can also be awaited like `dispatch_sync`) but the API is cumbersome for simple stuff. - maybe we could wrap it?
+    ///     - `CFRunLoopPerformBlock()`? >> Yes sounds good. <<
+    ///
+    /// Sidenote: NSRunLoop vs CFRunLoop:
+    ///     They are not the same. NSRunLoop is a higher-level wrapper around CFRunLoop. Every NSThread has an NSRunLoop. NSRunLoop APIs are generally not thread safe (according to the docs), while CFRunLoop APIs seem to be.
+    ///
+    /// Discussion: Which runLoop mode(s) to use?
+    ///     In MMF, we're usually processing user input. When we run that stuff on the mainThread, we want it to have the highest priority on the thread to maximize responsiveness.
+    ///     Using `NSRunLoopCommonModes`, our workload runs if the runLoop is in default, modal, or eventTracking mode (by default) (Source: https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Multithreading/RunLoopManagement/RunLoopManagement.html#//apple_ref/doc/uid/10000057i-CH16)
+    ///     To run our workload with higher priority, we can run our workload in *all modes*.
+    ///     To run our workload with *even higher* priority, we could run the runLoop in a custom mode. But I'm not sure how to do that [Jan 2025]
+    ///
+    /// Thread-safety:
+    ///     Should be pretty thread-safe as far as I can tell.
+    ///
+    /// Future plans:
+    ///     TODO: (Over time) Replace uses of `dispatch_async()` with MFCFRunLoopPerform().
+    ///     (Also (over time): remove DispatchQueues in favour of NSThread and NSRunLoop – so we can reduce thread count and gain more control over threading behavior.)
+    /// @noGCDCleanup
+    ///     Update this comment, maybe simplify code (we'll never use the `modes` arg, probably)
+
+    modes = _resolveModes(rl, modes);
+    CFRunLoopPerformBlock(rl, (__bridge void *)modes, workload);
+    CFRunLoopWakeUp(rl);
+}
+
+static void _cfRunLoopTimerCallback(CFRunLoopTimerRef timer, void *info) {
+    void (^workload)(void) = (__bridge id)info;
+    workload();
+}
+void MFCFRunLoopPerform_delay(CFRunLoopRef _Nonnull rl, NSArray<NSRunLoopMode> *_Nullable modes, double delayInSeconds, void (^_Nonnull workload)(void)) {
+    if (delayInSeconds <= 0) return MFCFRunLoopPerform(rl, modes, workload);
+    CFRunLoopTimerContext ctx = {
+        .info = (__bridge void *)workload,
+        .release = CFRelease, .retain = CFRetain, .copyDescription = CFCopyDescription,
+    };
+    CFRunLoopTimerRef timer = CFRunLoopTimerCreate(kCFAllocatorDefault, /*fireDate*/CFAbsoluteTimeGetCurrent() + delayInSeconds, /*interval*/0, /*flags*/0, /*order*/0, _cfRunLoopTimerCallback, &ctx);
+    modes = _resolveModes(rl, modes);
+    if (!isclass(modes, NSArray)) modes = @[modes];
+    for (NSRunLoopMode mode in modes) CFRunLoopAddTimer(rl, timer, (void *)mode);
+    CFRelease(timer);
+}
+
+#if 0 /** [Sep 2026] Unused. */
+    bool MFCFRunLoopPerform_sync(CFRunLoopRef _Nonnull rl, NSArray<NSRunLoopMode> *_Nullable modes, NSTimeInterval timeout, void (^_Nonnull workload)(void)) {
+
+        /// Variant of MFCFRunLoopPerform which waits for the workload to complete (or does the workload immediately if `rl` is the current runLoop.)
+        ///     Sort of an analog to `dispatch_sync()` (if `MFCFRunLoopPerform()` was `dispatch_async()`)
+        ///     Returns `1` if waiting timed out. `0` otherwise.
+        ///     Pass `timeout <= 0` to disable the timeout.
+        ///
+        /// Caution: If you don't pass a timeout, this can lead to deadlocks!
+        ///     (Deadlocks can happen if you're waiting for a thread which (indirectly) waits for you. As long as `workload` doesn't wait for anything/acquire any locks, there can't be deadlocks.)
+
+        bool didTimeOut = false;
+
+        if (CFEqual(rl, CFRunLoopGetCurrent())) {
+            workload();
+            return didTimeOut;
+        }
+
+        NSDate *timeoutDate = (timeout <= 0) ? nil : [NSDate dateWithTimeIntervalSinceNow: timeout]; /// We calculate the timeoutDate early in the function, so that it's accurate. Not sure if that's silly.
+
+        MFGate *gate = [MFGate new];
+        MFCFRunLoopPerform(rl, modes, ^{ [gate doWork: workload]; });
+        didTimeOut = [gate waitForWorkUntilDate: timeoutDate]; /// We completely block the current thread/runloop. Do the waiting `-[NSObject performSelector:onThread:...]` APIs do that, too?
+
+        return didTimeOut;
+    }
+#endif
+
+#pragma mark - Time
+
+uint64_t secondsToMachTime(CFTimeInterval tsSeconds) {
+    
+    /// Convert to nanoseconds
+    double tsNano = tsSeconds * NSEC_PER_SEC;
+    
+    /// Get the timebase info
+    mach_timebase_info_data_t info;
+    mach_timebase_info(&info);
+    
+    /// Convert to mach
+    double tsMach = tsNano;
+    tsMach /= ((double)info.numer)/((double)info.denom);
+    uint64_t tsMachInt = (uint64_t)round(tsMach);
+    
+    /// Return
+    return tsMachInt;
+}
+
+CFTimeInterval machTimeToSeconds(uint64_t tsMach) {
+    
+    /// Get the timebase info
+    mach_timebase_info_data_t info;
+    mach_timebase_info(&info);
+    
+    /// Convert to nanoseconds
+    double tsNano = tsMach;
+    tsNano *= ((double)info.numer)/((double)info.denom);
+    
+    /// Convert to seconds
+    CFTimeInterval tsSeconds = tsNano / NSEC_PER_SEC;
+    
+    /// Return
+    return tsSeconds;
+}
+
+#pragma mark - Catch NSException in Swift
+
+NSException * _Nullable tryCatch(void (^tryBlock)(void)) {
+    
+    /// Src: https://stackoverflow.com/a/32991585/10601702
+    ///     Haven't tested this.
+    ///     Might be better to return a struct with the exception and the block result?
+    
+    NSException *e = nil;
+    @try {
+        tryBlock();
+    }
+    @catch (NSException *exception) {
+        e = exception;
+    }
+    @finally {
+        return e;
+    }
+}
+
+#pragma mark - Use private classes
+
++ (id)getPrivateValueOf:(id)obj forName:(NSString *)name {
+    
+    /// Look through all ivars and properties of `obj` and return the first value with name `name`
+    /// -> Actually this only looks at ivars, and ignores values that aren't objects. Because that's all we need it for right now.
+    /// -> We use this for changing tabs programmatically in `coolSelectTab(identifier: String)`, so don't break it!
+    
+    id result;
+    id __strong * resultPtr = &result;
+    
+    iterateIvarsOn(obj, ^(Ivar ivar, BOOL *stop) {
+        
+        NSString *ivarName = @(ivar_getName(ivar) ?: "");
+        
+        if ([name isEqual:ivarName]) {
+            
+            const char *typeEncoding = ivar_getTypeEncoding(ivar);
+            BOOL isObject = typeEncoding[0] == '@';
+            if (!isObject) return; /// Ignore everything except objects, because we don't need more rn
+            
+            id value = (id)object_getIvar(obj, ivar);
+            if (value == nil) return;
+            
+            *resultPtr = value;
+            
+            *stop = YES;
+        }
+    });
+    
+    return result;
+}
+
+#pragma mark - Investigate private classes
+
++ (NSString *)dumpClassInfo:(id)obj {
+    /// See this article to understand type encodings: https://nshipster.com/type-encodings/
+    
+    Class class = [obj class];
+    
+    /// Name
+    const char *className = class_getName(class);
+    
+    /// Properties
+    NSMutableArray *properties = [NSMutableArray array];
+    
+    iteratePropertiesOn(obj, ^(objc_property_t property, NSString *name, NSString *attributes, BOOL *stop) {
+        [properties addObject:name];
+    });
+
+    /// Ivars
+    NSMutableArray *ivars = [NSMutableArray array];
+    
+    iterateIvarsOn(obj, ^(Ivar ivar, BOOL *stop) {
+        
+        NSString *name = [@(ivar_getName(ivar) ?: "") copy];
+        [ivars addObject:name];
+    });
+
+    /// Methods
+    NSMutableArray *methods = [NSMutableArray array];
+    iterateMethodsOn(obj, ^(Method _Nonnull method, struct objc_method_description *_Nonnull description, BOOL *stop) {
+        
+        [methods addObject:[NSString stringWithFormat: @"%@ | type: \'%@\'", @(sel_getName(description->name ?: NSSelectorFromString(@""))), @(description->types ?: "")]];
+    });
+
+    /// Class Methods
+    NSMutableArray *classMethods = [NSMutableArray array];
+    iterateMethodsOn([obj class], ^(Method method, struct objc_method_description *description, BOOL *stop) {
+        
+        [classMethods addObject:[NSString stringWithFormat: @"%@ | type: \'%@\'", @(sel_getName(description->name ?: NSSelectorFromString(@""))), @(description->types ?: "")]];
+    });
+    
+
+    
+    /// Return string
+    return [NSString stringWithFormat:@"Info on class %@ - properties: %@, ivars: %@, methods: %@, classMethods: %@", @(className), properties, ivars, methods, classMethods];
+}
+
+#pragma mark - Core class accessor funcs
+
+static void iterateIvarsOn(id obj, void(^callback)(Ivar ivar, BOOL *stop)) {
+ 
+    Class class = [obj class];
+    
+    unsigned int nIvars;
+    Ivar *ivarList = class_copyIvarList(class, &nIvars);
+    
+    for (int i = 0; i < nIvars; i++) {
+        
+        Ivar m = ivarList[i];
+        BOOL shouldStop = NO;
+        callback(m, &shouldStop);
+        if (shouldStop) break;
+    }
+}
+
+//static void iteratePropertyLikeMethods(id obj, void(^callback)(Method method, struct objc_method_description *description, id value, BOOL *stop)) {
+//    
+//    /// This can cause leaks. See https://stackoverflow.com/questions/7017281/performselector-may-cause-a-leak-because-its-selector-is-unknown
+//    ///     -> I think the iterateIvars function can also cause leaks in the same way.
+//    
+//    iterateMethodsOn(obj, ^(Method method, struct objc_method_description *description, BOOL *stop) {
+//        
+//        /// Check if last char is `:` to see if method has arguments
+//        SEL sel = description->name;
+//        const char *name = sel_getName(sel);
+//        unsigned long len = strlen(name);
+//        char lastChar = name[len-1];
+//        if (lastChar == ':') return;
+//        id value = [obj performSelector:sel];
+//        if (value == nil) return;
+//        callback(method, description, value, stop);
+//    });
+//}
+
+static void iterateMethodsOn(id _Nullable obj, void(^_Nonnull callback)(Method _Nonnull method, struct objc_method_description *_Nonnull description, BOOL *_Nonnull stop)) {
+    
+    /// To iterate class methods, pass in [obj class]
+    
+    Class _Nullable class = [obj class];
+    
+    unsigned int nMethods;
+    Method _Nonnull *_Nullable methodList = class_copyMethodList(class, &nMethods);
+    
+    for (int i = 0; i < nMethods; i++) {
+        
+        Method _Nonnull m = methodList[i];
+        struct objc_method_description *_Nonnull d = method_getDescription(m);
+        
+        BOOL shouldStop = NO;
+        callback(m, d, &shouldStop);
+        if (shouldStop) break;
+    }
+    
+    free(methodList);
+}
+
+static void iteratePropertiesOn(id _Nullable obj, void(^_Nonnull callback)(objc_property_t _Nonnull property, NSString *_Nullable name, NSString *_Nullable attributes, BOOL *_Nonnull stop)) {
+    
+    Class _Nullable class = [obj class];
+    
+    /// Properties
+    unsigned int nProperties;
+    objc_property_t _Nonnull *_Nullable propertyList = class_copyPropertyList(class, &nProperties);
+    
+    for (int i = 0; i < nProperties; i++) {
+        objc_property_t _Nonnull m = propertyList[i];
+        const char *_Nonnull name = property_getName(m);
+        const char *_Nullable attrs = property_getAttributes(m);
+        BOOL shouldStop = NO;
+        callback(m, @(name), @(attrs ?: ""), &shouldStop);
+        if (shouldStop) break;
+    }
+    
+    free(propertyList);
+}
+
+#pragma mark - Use command-line tools
+
++ (NSString *)launchCLT:(NSURL *)executableURL withArguments:(NSArray<NSString *> *)arguments error:(NSError *_Nullable * _Nullable)errorPtr {
+    
+    /// In contrast to the other launchCTL method below, this waits for the CLTs exit and then returns the output of the CLT as well as an error
+    /// TODO: Make this take an executablePath instead of an executableURL, because that makes it much easier to use with our constants like kMFLaunchctlPath
+    
+    
+    /// Declare error if none is passed in
+    ///     So we can still retrieve errors for internal logic and debug messages. Not sure about the __autoreleasing stuff.
+    NSError *__autoreleasing localError;
+    if (errorPtr == NULL) {
+        errorPtr = &localError;
+    }
+    
+    /// Init pipes
+    NSPipe *pipe = [NSPipe pipe];
+    NSPipe *errorPipe = [NSPipe pipe];
+    
+    /// Init task
+    NSTask *task = [[NSTask alloc] init];
+    [task setExecutableURL: executableURL.absoluteURL];
+    [task setArguments: arguments];
+    [task setStandardOutput:pipe];
+    [task setStandardError:errorPipe];
+    
+    /// Launch task and wait
+    [task launchAndReturnError:errorPtr];
+    [task waitUntilExit];
+    
+    /// Get Result
+    
+    NSString *result;
+    
+    if (*errorPtr != nil) {
+        result = @"";
+    } else {
+        
+        /// Get stdout
+        NSFileHandle *output_fileHandle = [pipe fileHandleForReading];
+        NSData *output_data = [output_fileHandle readDataToEndOfFile];
+        NSString *output_string = [[NSString alloc] initWithData:output_data encoding:NSUTF8StringEncoding];
+        
+        /// Get stderr
+        NSFileHandle *error_fileHandle = [errorPipe fileHandleForReading];
+        NSData *error_data = [error_fileHandle readDataToEndOfFile];
+        NSString *error_string = [[NSString alloc] initWithData:error_data encoding:NSUTF8StringEncoding];
+        
+        /// Process stdout
+        if (output_string != nil) {
+            result = output_string;
+        } else {
+            result = @"";
+        }
+        /// Process stderr
+        if (error_string != nil && ![error_string isEqual:@""]) {
+            *errorPtr = [NSError errorWithDomain:@"MFStderrDomain" code:0 userInfo:@{
+                @"stderr": error_string,
+            }];
+        }
+    }
+    
+    /// Debug
+    if (runningDebugMode()) {
+        NSString *errorDesc = @"";
+        if (errorPtr != NULL && *errorPtr != nil) {
+            errorDesc = (*errorPtr).debugDescription;
+        }
+        DDLogDebug("Called command line tool at %@ with args: %@ - result: %@, error: %@", executableURL, arguments, result, errorDesc);
+    }
+    
+    /// Return
+    return result;
+}
+
++ (void)launchCLT:(NSURL *)commandLineTool
+         withArgs:(NSArray <NSString *> *)args {
+        
+    /// TODO: Think about when / why we're using this instead of the other launchCTL method. Should we really just ignore errors?
+    
+    DDLogDebug("Calling command line tool at %@ with args: %@ using async API", commandLineTool, args);
+    
+    [NSTask launchedTaskWithExecutableURL:commandLineTool arguments:args error:NULL terminationHandler:nil];
+}
+
+#pragma mark - Monitor file system
+
++ (FSEventStreamRef)scheduleFSEventStreamOnPaths:(NSArray<NSString *> *)paths withCallback:(FSEventStreamCallback)callback {
+    FSEventStreamRef stream = FSEventStreamCreate(kCFAllocatorDefault, callback, NULL, (__bridge CFArrayRef)paths, kFSEventStreamEventIdSinceNow, 1, kFSEventStreamCreateFlagIgnoreSelf ^ kFSEventStreamCreateFlagUseCFTypes);
+    FSEventStreamScheduleWithRunLoop(stream, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+    FSEventStreamStart(stream);
+    return stream;
+}
++ (void)destroyFSEventStream:(FSEventStreamRef _Nullable)stream {
+    if (stream != NULL) {
+        FSEventStreamInvalidate((void *_Nonnull)stream);
+        FSEventStreamRelease((void *_Nonnull)stream);
+    }
+}
+
+#pragma mark - Debug
+
+NSString *_Nonnull bitflagstring(int64_t flags, NSString *const _Nullable bitposToNameMap[_Nullable], int bitposToNameMapCount) {
+    
+    /**
+    Debug-printing for enums. [Apr 2025]
+        
+    Also see: `CodeStyle.md`
+    Usage example:
+        ```
+        NSString *MFCGDisplayChangeSummaryFlags_ToString(CGDisplayChangeSummaryFlags flags) {
+        
+            static NSString *map[] = {
+                [bitpos(kCGDisplayBeginConfigurationFlag)]      = @"BeginConfiguration",
+                [bitpos(kCGDisplayMovedFlag)]                   = @"Moved",
+                [bitpos(kCGDisplaySetMainFlag)]                 = @"SetMain",
+                [bitpos(kCGDisplaySetModeFlag)]                 = @"SetMode",
+                [bitpos(kCGDisplayAddFlag)]                     = @"Add",
+                [bitpos(kCGDisplayRemoveFlag)]                  = @"Remove",
+                [bitpos(kCGDisplayEnabledFlag)]                 = @"Enabled",
+                [bitpos(kCGDisplayDisabledFlag)]                = @"Disabled",
+                [bitpos(kCGDisplayMirrorFlag)]                  = @"Mirror",
+                [bitpos(kCGDisplayUnMirrorFlag)]                = @"UnMirror",
+                [bitpos(kCGDisplayDesktopShapeChangedFlag)]     = @"DesktopShapeChanged",
+            };
+            
+            NSString *result = bitflagstring(flags, map, arrcount(map));
+            return result;
+        };
+        ```
+    */
+    
+    /// Build result
+    NSMutableString *result = [NSMutableString string];
+    
+    int i = 0;
+    while (1) {
+        
+        /// Break
+        if (flags == 0) break;
+        
+        if ((flags & 1) != 0) { /// If `flags` contains bit `i`
+            
+            /// Insert separator
+            if (result.length > 0)
+                [result appendString:@" | "];
+            
+            /// Get string describing bit `i`
+            NSString *bitName = safeindex(bitposToNameMap, bitposToNameMapCount, i, nil);
+            NSString *str = (bitName && bitName.length > 0) ? bitName : stringf(@"(1 << %d)", i);
+            
+            /// Append
+            [result appendString:str];
+        }
+        
+        /// Increment
+        flags >>= 1;
+        i++;
+    }
+    
+    /// Wrap result in ()
+    result = [NSMutableString stringWithFormat:@"(%@)", result];
+    
+    /// Return
+    return result;
+}
+
+/*
++ (NSString *)binaryRepresentation:(int64_t)value {
+        
+    /// Note: [Apr 2025]: (While cleaning up merge of branch master into feature-strings-catalog)
+    /// Moved this from HelperUtility.m to SharedUtility.m. Other parts of the program need this in SharedUtility to compile. Not sure what happened here. I guess the merge got messed up. The arg type changed from `unsigned int` to `int64_t` I think.
+    ///     Update: Oh but all usages of this are commented out.
+    ///         Also, I think we had a macro for this that was more powerful in EventLoggerForBrad or somewhere. So we're commenting this out. Use the macro instead probably.
+    ///             Update: The macro was binarystring() I think
+        
+    uint64_t one = 1; /// A literal 1 is apparently 32 bits, so we need to declare it here to make it 64 bits. Declaring as unsigned only to silence an error when shiftting this left by 63 places.
+    
+    int64_t nibbleCount = sizeof(value) * 2;
+    NSMutableString *bitString = [NSMutableString stringWithCapacity:nibbleCount * 5];
+    
+    for (int64_t index = 4 * nibbleCount - 1; index >= 0; index--)
+    {
+        [bitString appendFormat:@"%i", value & (one << index) ? 1 : 0];
+        if (index % 4 == 0)
+        {
+            [bitString appendString:@" "];
+        }
+    }
+    return bitString;
+}
+*/
+
++ (NSString *)callerInfo {
+    return [NSString stringWithFormat:@" - %@", [[NSThread callStackSymbols] objectAtIndex:2]];
+}
++ (void)printStackTrace {
+    DDLogInfo("PRINTING STACK TRACE: %@", [NSThread callStackSymbols]);
+}
+
++ (NSString *)currentDispatchQueueDescription {
+    return dispatch_get_current_queue().description;
+}
+
+/// For debugging.
++ (void)printInvocationCountWithId:(NSString *)strId {
+    
+    static NSMutableDictionary<NSString *, NSNumber *> *ids;
+    static BOOL hasBeenInited = NO;
+    
+    if (hasBeenInited == NO) {
+        ids = [NSMutableDictionary dictionary];
+        hasBeenInited = YES;
+    }
+    
+    int counterForId;
+    
+    NSNumber *counterForIdFromDict = ids[strId];
+    if (counterForIdFromDict == nil) {
+        counterForId = 0;
+    } else {
+        counterForId = counterForIdFromDict.intValue;
+    }
+    
+    counterForId++;
+    
+    DDLogInfo("%@: %d", strId, counterForId);
+    
+    ids[strId] = @(counterForId);
+    
+}
+
+#pragma mark - Button Numbers
+
++ (CGEventType)CGEventTypeForButtonNumber:(MFMouseButtonNumber)button isMouseDown:(BOOL)isMouseDown {
+    
+    CGEventType mouseEventType;
+    
+    if (isMouseDown) {
+       if (button == kMFMouseButtonNumberLeft) {
+           mouseEventType = kCGEventLeftMouseDown;
+       } else if (button == kMFMouseButtonNumberRight) {
+           mouseEventType = kCGEventRightMouseDown;
+       } else {
+           mouseEventType = kCGEventOtherMouseDown;
+       }
+   } else {
+        if (button == kMFMouseButtonNumberLeft) {
+            mouseEventType = kCGEventLeftMouseUp;
+        } else if (button == kMFMouseButtonNumberRight) {
+            mouseEventType = kCGEventRightMouseUp;
+        } else {
+            mouseEventType = kCGEventOtherMouseUp;
+        }
+    }
+    
+    return mouseEventType;
+}
+
++ (CGMouseButton)CGMouseButtonFromMFMouseButtonNumber:(MFMouseButtonNumber)button {
+    return (CGMouseButton) button - 1;
+}
+
+#pragma mark - Remaps data model assessment
+
++ (BOOL)button:(NSNumber * _Nonnull)button isPartOfModificationPrecondition:(NSDictionary *)modificationPrecondition {
+    NSArray *buttonPreconditions = modificationPrecondition[kMFModificationPreconditionKeyButtons];
+    NSIndexSet *buttonIndexes = [buttonPreconditions indexesOfObjectsPassingTest:^BOOL(NSDictionary *_Nonnull dict, NSUInteger idx, BOOL * _Nonnull stop) {
+        return [dict[kMFButtonModificationPreconditionKeyButtonNumber] isEqualToNumber:button];
+    }];
+    return buttonIndexes.count != 0;
+}
+
+#pragma mark - Coordinate conversion
+
+#pragma mark NSView frame conversion
+
+/// See NSView+Additions
+
+#pragma mark Flipping
+
+/// The *cocoa*  global "display" coordinate system starts at the bottom left of the zero screen, while the *quartz* coordinate system starts at the top left
+/// We sometimes need to convert between them
+/// I've tried to write conversion functions before (Find them in HelperUtility) but I don't think they worked. I'll give it one more try. Edit: This works!
+
+/// Convenience wrappers
+
++ (NSPoint)quartzToCocoaScreenSpace_Point:(CGPoint)quartzPoint {
+    return [self quartzToCocoaScreenSpace:CGRectMake(quartzPoint.x, quartzPoint.y, 0, 0)].origin;
+}
+
++ (CGPoint)cocoaToQuartzScreenSpace_Point:(NSPoint)cocoaPoint {
+    return [self cocoaToQuartzScreenSpace:NSMakeRect(cocoaPoint.x, cocoaPoint.y, 0, 0)].origin;
+}
+
++ (NSRect)quartzToCocoaScreenSpace:(CGRect)quartzFrame {
+    return [self cocoaToQuartzScreenSpaceConversionWithOriginFrame:quartzFrame];
+}
++ (CGRect)cocoaToQuartzScreenSpace:(NSRect)cocoaFrame {
+    return [self cocoaToQuartzScreenSpaceConversionWithOriginFrame:cocoaFrame];
+}
+
+/// Base function
+
++ (CGRect)cocoaToQuartzScreenSpaceConversionWithOriginFrame:(CGRect)originFrame {
+    
+    /// Src: https://stackoverflow.com/questions/19884363/in-objective-c-os-x-is-the-global-display-coordinate-space-used-by-quartz-d
+    
+    /// Get zero screen
+    NSScreen *zeroScreen = NSScreen.screens[0]; /// TODO: Simplify/optimize this: Use [NSScreen +_zeroScreenHeight]
+    CGFloat screenHeight = zeroScreen.frame.size.height;
+    
+    /// Extract values
+    CGFloat originY = originFrame.origin.y;
+    CGFloat frameHeight = originFrame.size.height;
+    
+    /// Get new y
+    CGFloat destinationY = screenHeight - (originY + frameHeight);
+    
+    /// Get new frame
+    CGRect destinationFrame = originFrame;
+    destinationFrame.origin.y = destinationY;
+    
+    /// return
+    return destinationFrame;
+}
+
+#pragma mark - Deep copies
+
++ (id) deepMutableCopyOf: (id)object {
+    
+    /// NSPropertyListSerialization fails for our remapDict because we're using NSNumber as dictionary keys. CFPropertyListCreateDeepCopy doesn't work either.
+    ///     So we're doing this manually...
+    /// Edit: Doesn't NSPropertyListSerialization work? That can also create mutable containers. Maybe this is faster though.
+        
+    if ([object isKindOfClass:NSDictionary.class]) {
+        ///
+        /// Dict
+        ///
+        NSDictionary *og = (NSDictionary *)object;
+        NSMutableDictionary *new = [NSMutableDictionary dictionary];
+        [og enumerateKeysAndObjectsUsingBlock:^(id  _Nonnull key, id  _Nonnull value, BOOL * _Nonnull stop) {
+            id newKey = [SharedUtility deepMutableCopyOf:key];
+            id newValue = [SharedUtility deepMutableCopyOf:value];
+            new[newKey] = newValue;
+        }];
+        return new;
+    } else if ([object isKindOfClass:NSArray.class]) {
+        ///
+        /// Array
+        ///
+        NSArray *og = (NSArray *)object;
+        NSMutableArray *new = [NSMutableArray array];
+        for (id element in og) {
+            [new addObject:[SharedUtility deepMutableCopyOf:element]];
+        }
+        return new;
+    } else {
+        ///
+        /// Leave node
+        ///
+        if ([object conformsToProtocol:@protocol(NSMutableCopying)]) {
+            return [object mutableCopy];
+        } else {
+            return object;
+        }
+    }
+}
+
++ (id _Nullable)deepCopyOf:(id _Nullable)object {
+
+    /// TODO: Replace this with the error-returning implementation (below)
+    
+    /// Check nil
+    if (object == nil) return nil;
+    
+    /// New approach
+//    return [self deepCopyOf:object error:nil];
+    
+    /// Old approach
+    return [NSKeyedUnarchiver unarchiveObjectWithData:[NSKeyedArchiver archivedDataWithRootObject:object]];
+}
+
++ (id<NSCoding>_Nullable)deepCopyOf:(id<NSCoding> _Nonnull)original error:(NSError *_Nullable *_Nullable)error {
+    
+    /// Copied this from the Swift implementation in SharedUtilitySwift, since the Swift implementation wasn't compatible with ObjC. We still like to keep both around since the Swift version is nicer with it's generic types. Maybe generics are also possible in this form in ObjC but I don't know how.
+    /// The simpler default methods only work with `NSSecureCoding` objects. This implementation also works with `NSCoding` objects.
+    /// Src:  https://developer.apple.com/forums/thread/107533
+    /// Performance: This is actually superrrr slow. Was the old one this slow as well? Edit: I think the old one was also very slow.
+    ///     Edit: [Feb 2025] I implemented a custom MFDeepCopyCoder but I could only make it 20% faster than the NSKeyedArchiver. Maybe NSKeyedArchver got faster, or keyed archiving/unarchiving of objc objects is just inherently slow?
+    ///     Edit: [Feb 2025] Also, is manual recursion (Which we use in `deepMutableCopyOf:`) perhaps faster than an archiver? MFDeepCopyCoder was doing recursion like that afaik, so maybe not.
+    /// TODO: Use MFEncode() and MFDecode() instead of this.
+    
+    assert((id)original != nil);
+    
+    NSData *data = [NSKeyedArchiver archivedDataWithRootObject:original requiringSecureCoding:false error:error];
+    if (data == nil) {
+        assert(false);
+        return nil;
+    }
+    
+    NSKeyedUnarchiver *unarchiver = [[NSKeyedUnarchiver alloc] initForReadingFromData:data error:error];
+    unarchiver.requiresSecureCoding = false;
+    
+    id<NSCoding> copy = [unarchiver decodeObjectForKey:NSKeyedArchiveRootObjectKey];
+    
+    return copy;
+}
+
++ (NSDictionary *)dictionaryWithOverridesAppliedFrom:(NSDictionary *)src to: (NSDictionary *)dst {
+    
+    /// Optimization idea:
+    ///     TODO: Consider returning a mutable dict to avoid constantly using `- mutableCopy`. Maybe even alter `dst` in place and return nothing (And rename to `applyOverridesFrom:to:`).
+    ///     Copy all leaves (elements which aren't dictionaries) from `src` to `dst`. Return the result. (`dst` itself isn't altered)
+    ///     Recursively search for leaves in `src`. For each srcLeaf found, create / replace a leaf in `dst` at a keyPath identical to the keyPath of srcLeaf and with the value of srcLeaf.
+    ///
+    /// Organization idea: [Sep 2025]
+    ///     Probably replace this with new `-[NSMutableDictionary applyOverridesFromDictionary:]`
+    
+    NSMutableDictionary *dstMutable = [dst mutableCopy];
+    if (dstMutable == nil) {
+        dstMutable = [NSMutableDictionary dictionary];
+    }
+    for (id<NSCopying> key in src) {
+        NSObject *dstVal = dst[key];
+        NSObject *srcVal = src[key];
+        if ([srcVal isKindOfClass: [NSDictionary class]] || [srcVal isKindOfClass: [NSMutableDictionary class]]) { // Not sure if checking for mutable dict AND dict is necessary
+            /// Nested dictionary found. Recursing.
+            NSDictionary *recursionResult = [self dictionaryWithOverridesAppliedFrom: (NSDictionary *)srcVal to: (NSDictionary *)dstVal];
+            dstMutable[key] = recursionResult;
+        } else {
+            // Leaf found
+            dstMutable[key] = srcVal;
+        }
+    }
+    return dstMutable;
+}
+
++ (void)resetDispatchGroupCount:(dispatch_group_t)group {
+    /// Reset smoothing group counter to 0
+    /// This doesn't work, don't use this.
+    
+    assert(false);
+    
+    /// Method 2
+    
+//    dispatch_group_wait(group, DISPATCH_TIME_NOW); /// Time out immediately to reset state. Doesn't work....
+    
+    /// Method 1 (kinda hacky and unstable method)
+    
+    NSString *groupDebugDescription = group.debugDescription;
+    NSRange groupCountRange = [groupDebugDescription rangeOfString:@"(?<= count = ).*?(?=,)" options:NSRegularExpressionSearch];
+    /// ^ Actual Regex for count (?<= count = ).*?(?=,)
+    NSString *groupCountString = [groupDebugDescription substringWithRange:groupCountRange];
+    NSNumberFormatter *numberFormatter = [[NSNumberFormatter alloc] init];
+    numberFormatter.numberStyle = NSNumberFormatterDecimalStyle;
+    int groupCount = [numberFormatter numberFromString:groupCountString].intValue;
+    for (int i = 0; i < groupCount; i++) {
+        dispatch_group_leave(group);
+    }
+}
+
+@end
